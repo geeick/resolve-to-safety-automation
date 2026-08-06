@@ -1,0 +1,41 @@
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Generated files
+shift_report_downloads/
+shift_report_outputs/
+price_consistency_issues.csv
+
+# Raw/private parking reports
+All-Report*.csv
+ALL-Safety-Report*.csv
+*Parking-Report*.csv
+safetypark-shift-reports*.csv
+
+# Editors
+.vscode/
+.idea/
+
+# Windows/macOS system files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporary files
+*.log
+*.tmp
+~$*
