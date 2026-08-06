@@ -1,5 +1,5 @@
 # Command
-py -m streamlit run shift_report_web_app_v23_pricing_suggestions.py
+py -m streamlit run shift_report_web_app.py
 
 
 # Resolve to SafetyPark Shift Report Automation

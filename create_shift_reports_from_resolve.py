@@ -44,6 +44,12 @@ Example:
 Run safe review:
     py create_shift_reports_from_resolve.py
 
+Test one shift report only:
+    py create_shift_reports_from_resolve.py --only-shift-location "100 Venice Way"
+
+Test one shift report and open SafetyPark after confirmation:
+    py create_shift_reports_from_resolve.py --only-shift-location "100 Venice Way" --open-safetypark
+
 Run using already-downloaded CSV:
     py create_shift_reports_from_resolve.py --csv "resolve_scantopay_yesterday.csv"
 
@@ -68,6 +74,8 @@ from playwright.sync_api import sync_playwright
 
 DOWNLOAD_FOLDER = Path("shift_report_downloads")
 OUTPUT_FOLDER = Path("shift_report_outputs")
+
+AUTO_SAVE_EACH_LOCATION = False
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 OUTPUT_FOLDER.mkdir(exist_ok=True)
@@ -368,87 +376,32 @@ def build_shift_report_data(csv_path, target_date, mapping_file):
     mapping = load_location_mapping(mapping_file)
     df = apply_location_mapping(df, mapping)
 
-    non_ext = df[~df["is_extension"]].copy()
-    ext = df[df["is_extension"]].copy()
-
     rows = []
 
-    for location, loc_non_ext in non_ext.groupby("shift_report_location", dropna=False):
-        loc_ext = ext[ext["shift_report_location"] == location].copy()
+    # This now matches the Excel pivot method:
+    # Main pivot = all scan-to-pay rows, including EXT rows.
+    # Extension pivot = only rows where Ticket # contains -EXT.
+    # Cars charged by value = main amount bucket count - extension amount bucket count.
+    # Ending ticket = total main pivot count + 2.
 
-        scan_to_pay_cars = len(loc_non_ext)
+    for location, loc_all in df.groupby("shift_report_location", dropna=False):
+        loc_ext = loc_all[loc_all["is_extension"]].copy()
+
+        total_scan_to_pay_pivot_count = len(loc_all)
         extension_count = len(loc_ext)
 
-        # User requested: subtract number of extensions from the cars charged with scan-to-pay.
-        adjusted_cars_charged = max(scan_to_pay_cars - extension_count, 0)
-
-        # Starting ticket is 000001. Ending ticket is 2 more than number of cars parked.
         starting_ticket = "000001"
-        ending_ticket = format_ticket_number(adjusted_cars_charged + 2)
+        ending_ticket = format_ticket_number(total_scan_to_pay_pivot_count + 2)
 
-        # Count how many cars were charged each value.
-        # This uses Amount by default, not total with tax/fee.
-        amount_counts = (
-            loc_non_ext
+        main_amount_counts = (
+            loc_all
             .groupby("Amount")
             .size()
-            .reset_index(name="raw_scan_to_pay_count")
+            .reset_index(name="main_pivot_count")
             .sort_values("Amount")
         )
 
-        # Since extensions are subtracted from the cars charged, put the adjusted count in a separate field.
-        # Do not guess which dollar bucket to subtract from unless we can match EXT to base ticket.
-        amount_summary = []
-
-        for _, r in amount_counts.iterrows():
-            amount_summary.append({
-                "amount": float(r["Amount"]),
-                "raw_scan_to_pay_count": int(r["raw_scan_to_pay_count"]),
-            })
-
-        # Better adjustment: if an extension has a base ticket that exists in non_ext,
-        # subtract it from that original base ticket's Amount bucket.
-        adjusted_amount_counts = loc_non_ext[["base_ticket", "Amount"]].copy()
-        adjusted_amount_counts["keep_for_cars_charged"] = True
-
-        ext_base_tickets = set(loc_ext["base_ticket"].dropna().astype(str).tolist())
-
-        if ext_base_tickets:
-            # Subtract extension tickets from cars charged by removing matching base ticket rows first.
-            mask_matching_ext = adjusted_amount_counts["base_ticket"].astype(str).isin(ext_base_tickets)
-            adjusted_amount_counts.loc[mask_matching_ext, "keep_for_cars_charged"] = False
-
-            # If there are more extensions than matched base tickets, remove extra rows from the largest amount buckets.
-            matched_subtractions = int(mask_matching_ext.sum())
-            remaining_to_subtract = max(extension_count - matched_subtractions, 0)
-
-            if remaining_to_subtract > 0:
-                extra_indices = (
-                    adjusted_amount_counts[adjusted_amount_counts["keep_for_cars_charged"]]
-                    .sort_values("Amount", ascending=False)
-                    .head(remaining_to_subtract)
-                    .index
-                )
-                adjusted_amount_counts.loc[extra_indices, "keep_for_cars_charged"] = False
-
-        adjusted_bucket_df = adjusted_amount_counts[adjusted_amount_counts["keep_for_cars_charged"]].copy()
-
-        adjusted_buckets = (
-            adjusted_bucket_df
-            .groupby("Amount")
-            .size()
-            .reset_index(name="adjusted_cars_charged_count")
-            .sort_values("Amount")
-        )
-
-        adjusted_amount_summary = []
-        for _, r in adjusted_buckets.iterrows():
-            adjusted_amount_summary.append({
-                "amount": float(r["Amount"]),
-                "adjusted_cars_charged_count": int(r["adjusted_cars_charged_count"]),
-            })
-
-        overtime_amount_counts = (
+        extension_amount_counts = (
             loc_ext
             .groupby("Amount")
             .size()
@@ -456,77 +409,77 @@ def build_shift_report_data(csv_path, target_date, mapping_file):
             .sort_values("Amount")
         )
 
+        merged_counts = main_amount_counts.merge(
+            extension_amount_counts,
+            how="left",
+            on="Amount",
+        )
+
+        merged_counts["extension_count"] = merged_counts["extension_count"].fillna(0).astype(int)
+        merged_counts["cars_charged_count"] = (
+            merged_counts["main_pivot_count"] - merged_counts["extension_count"]
+        ).clip(lower=0).astype(int)
+
+        adjusted_amount_summary = []
+        for _, r in merged_counts.iterrows():
+            count = int(r["cars_charged_count"])
+            if count > 0:
+                adjusted_amount_summary.append({
+                    "amount": float(r["Amount"]),
+                    "adjusted_cars_charged_count": count,
+                    "main_pivot_count": int(r["main_pivot_count"]),
+                    "extension_count_subtracted": int(r["extension_count"]),
+                })
+
+        raw_amount_summary = []
+        for _, r in main_amount_counts.iterrows():
+            raw_amount_summary.append({
+                "amount": float(r["Amount"]),
+                "raw_scan_to_pay_count": int(r["main_pivot_count"]),
+            })
+
         overtime_summary = []
-        for _, r in overtime_amount_counts.iterrows():
+        for _, r in extension_amount_counts.iterrows():
             overtime_summary.append({
                 "amount": float(r["Amount"]),
                 "extension_count": int(r["extension_count"]),
             })
 
+        cars_charged_after_subtracting_extensions = int(
+            sum(item["adjusted_cars_charged_count"] for item in adjusted_amount_summary)
+        )
+
+        resolve_locations_used = sorted(loc_all["Location"].dropna().astype(str).unique().tolist())
+
         rows.append({
             "shift_report_location": location,
+            "resolve_locations_used": resolve_locations_used,
             "date": safe_date(target_date),
             "period": "Graveyard",
             "starting_ticket": starting_ticket,
             "ending_ticket": ending_ticket,
-            "scan_to_pay_cars_raw": scan_to_pay_cars,
+            "scan_to_pay_cars_raw": total_scan_to_pay_pivot_count,
             "extension_tickets": extension_count,
-            "cars_charged_after_subtracting_extensions": adjusted_cars_charged,
-            "gross_scan_to_pay_amount": round(float(loc_non_ext["Amount"].sum()), 2),
+            "cars_charged_after_subtracting_extensions": cars_charged_after_subtracting_extensions,
+            "gross_scan_to_pay_amount": round(float(loc_all["Amount"].sum()), 2),
             "gross_extension_amount": round(float(loc_ext["Amount"].sum()), 2),
-            "gross_total_amount": round(float(df[df["shift_report_location"] == location]["Amount"].sum()), 2),
-            "raw_amount_summary": amount_summary,
+            "gross_total_amount": round(float(loc_all["Amount"].sum()), 2),
+            "raw_amount_summary": raw_amount_summary,
             "adjusted_amount_summary": adjusted_amount_summary,
             "overtime_summary": overtime_summary,
         })
 
-    # Include locations that only have extension tickets.
-    non_ext_locations = set(non_ext["shift_report_location"].dropna().astype(str).tolist())
-
-    for location, loc_ext in ext.groupby("shift_report_location", dropna=False):
-        if str(location) in non_ext_locations:
-            continue
-
-        extension_count = len(loc_ext)
-        starting_ticket = "000001"
-        ending_ticket = format_ticket_number(2)
-
-        overtime_amount_counts = (
-            loc_ext
-            .groupby("Amount")
-            .size()
-            .reset_index(name="extension_count")
-            .sort_values("Amount")
-        )
-
-        overtime_summary = []
-        for _, r in overtime_amount_counts.iterrows():
-            overtime_summary.append({
-                "amount": float(r["Amount"]),
-                "extension_count": int(r["extension_count"]),
-            })
-
-        rows.append({
-            "shift_report_location": location,
-            "date": safe_date(target_date),
-            "period": "Graveyard",
-            "starting_ticket": starting_ticket,
-            "ending_ticket": ending_ticket,
-            "scan_to_pay_cars_raw": 0,
-            "extension_tickets": extension_count,
-            "cars_charged_after_subtracting_extensions": 0,
-            "gross_scan_to_pay_amount": 0.0,
-            "gross_extension_amount": round(float(loc_ext["Amount"].sum()), 2),
-            "gross_total_amount": round(float(loc_ext["Amount"].sum()), 2),
-            "raw_amount_summary": [],
-            "adjusted_amount_summary": [],
-            "overtime_summary": overtime_summary,
-        })
+    if not rows:
+        print("No shift report rows were created.")
+        print("This usually means the selected date has 0 matching rows in the CSV.")
+        return pd.DataFrame(), df
 
     reports = pd.DataFrame(rows).sort_values("shift_report_location").reset_index(drop=True)
 
     detailed_file = OUTPUT_FOLDER / f"shift_report_calculated_details_{safe_date(target_date)}.csv"
     reports_for_csv = reports.copy()
+    if "resolve_locations_used" in reports_for_csv.columns:
+        reports_for_csv["resolve_locations_used"] = reports_for_csv["resolve_locations_used"].astype(str)
     reports_for_csv["raw_amount_summary"] = reports_for_csv["raw_amount_summary"].astype(str)
     reports_for_csv["adjusted_amount_summary"] = reports_for_csv["adjusted_amount_summary"].astype(str)
     reports_for_csv["overtime_summary"] = reports_for_csv["overtime_summary"].astype(str)
@@ -535,8 +488,46 @@ def build_shift_report_data(csv_path, target_date, mapping_file):
     cleaned_rows_file = OUTPUT_FOLDER / f"shift_report_source_rows_{safe_date(target_date)}.csv"
     df.to_csv(cleaned_rows_file, index=False)
 
+    audit_rows = []
+    for _, report_row in reports.iterrows():
+        location = report_row["shift_report_location"]
+        resolve_locations_used = "; ".join(report_row.get("resolve_locations_used", []))
+
+        for item in report_row["raw_amount_summary"]:
+            audit_rows.append({
+                "shift_report_location": location,
+                "resolve_locations_used": resolve_locations_used,
+                "section": "main_scan_to_pay_pivot",
+                "amount": item["amount"],
+                "count": item["raw_scan_to_pay_count"],
+            })
+
+        for item in report_row["overtime_summary"]:
+            audit_rows.append({
+                "shift_report_location": location,
+                "resolve_locations_used": resolve_locations_used,
+                "section": "extension_pivot",
+                "amount": item["amount"],
+                "count": item["extension_count"],
+            })
+
+        for item in report_row["adjusted_amount_summary"]:
+            audit_rows.append({
+                "shift_report_location": location,
+                "resolve_locations_used": resolve_locations_used,
+                "section": "cars_charged_after_subtracting_extensions",
+                "amount": item["amount"],
+                "count": item["adjusted_cars_charged_count"],
+                "main_pivot_count": item["main_pivot_count"],
+                "extension_count_subtracted": item["extension_count_subtracted"],
+            })
+
+    audit_file = OUTPUT_FOLDER / f"shift_report_bucket_audit_{safe_date(target_date)}.csv"
+    pd.DataFrame(audit_rows).to_csv(audit_file, index=False)
+
     print("Saved calculated details:", detailed_file)
     print("Saved cleaned source rows:", cleaned_rows_file)
+    print("Saved bucket audit:", audit_file)
 
     return reports, df
 
@@ -556,15 +547,27 @@ def print_shift_report_review(reports):
 
     for _, row in reports.iterrows():
         print("\n" + "-" * 100)
-        print(f"LOCATION: {row['shift_report_location']}")
+        print(f"SHIFT REPORT LOCATION: {row['shift_report_location']}")
+
+        resolve_locations_used = row.get("resolve_locations_used", [])
+        if isinstance(resolve_locations_used, str):
+            resolve_locations_used = [resolve_locations_used]
+
+        print("RESOLVE LOCATIONS USED:")
+        if resolve_locations_used:
+            for resolve_location in resolve_locations_used:
+                print(f"  - {resolve_location}")
+        else:
+            print("  - Not available")
+
         print(f"DATE: {row['date']}")
         print(f"PERIOD: {row['period']}")
         print(f"STARTING TICKET: {row['starting_ticket']}")
         print(f"ENDING TICKET: {row['ending_ticket']}")
         print("")
-        print(f"Raw scan-to-pay cars: {row['scan_to_pay_cars_raw']}")
+        print(f"Main scan-to-pay pivot count: {row['scan_to_pay_cars_raw']}")
         print(f"Extension / overtime tickets: {row['extension_tickets']}")
-        print(f"Cars charged after subtracting extensions: {row['cars_charged_after_subtracting_extensions']}")
+        print(f"Cars charged after subtracting extension buckets: {row['cars_charged_after_subtracting_extensions']}")
         print("")
         print(f"Gross scan-to-pay amount: ${row['gross_scan_to_pay_amount']:.2f}")
         print(f"Gross extension amount: ${row['gross_extension_amount']:.2f}")
@@ -612,247 +615,404 @@ def require_terminal_confirmation():
 def login_to_safetypark_app(page):
     load_dotenv()
 
-    email = os.getenv("SAFETYPARK_APP_EMAIL") or os.getenv("SAFETYPARK_EMAIL")
-    password = os.getenv("SAFETYPARK_APP_PASSWORD") or os.getenv("SAFETYPARK_PASSWORD")
-    login_url = os.getenv("SAFETYPARK_APP_LOGIN_URL") or os.getenv("SAFETYPARK_LOGIN_URL")
-    shift_report_url = os.getenv("SAFETYPARK_SHIFT_REPORT_URL")
+    email = (
+        os.getenv("SAFETYPARK_EMAIL")
+        or os.getenv("SAFETY_PARK_EMAIL")
+        or os.getenv("SAFETY_EMAIL")
+        or os.getenv("RESOLVE_EMAIL")
+    )
 
-    if not email or not password or not login_url:
-        raise ValueError(
-            "Missing SafetyPark app .env values. Need SAFETYPARK_APP_EMAIL/PASSWORD/LOGIN_URL "
-            "or SAFETYPARK_EMAIL/PASSWORD/LOGIN_URL."
-        )
+    password = (
+        os.getenv("SAFETYPARK_PASSWORD")
+        or os.getenv("SAFETY_PARK_PASSWORD")
+        or os.getenv("SAFETY_PASSWORD")
+        or os.getenv("RESOLVE_PASSWORD")
+    )
+
+    login_url = (
+        os.getenv("SAFETYPARK_LOGIN_URL")
+        or os.getenv("SAFETY_PARK_LOGIN_URL")
+        or "https://safetyparkapp.com/login/"
+    )
+
+    if not email or not password:
+        raise ValueError("Missing SafetyPark login email/password in .env")
 
     print("Opening SafetyPark app login page...")
     page.goto(login_url, wait_until="networkidle")
+    page.wait_for_timeout(1500)
 
-    # Generic login selectors. We may need to adjust after seeing the app.
-    email_selectors = [
-        "input[type='email']",
-        "input[name='email']",
-        "input[id*='email' i]",
-        "input[placeholder*='email' i]",
-    ]
+    try:
+        page.wait_for_selector("#id_username", timeout=10000)
+        page.fill("#id_username", email)
+        print("Filled username using #id_username")
 
-    password_selectors = [
-        "input[type='password']",
-        "input[name='password']",
-        "input[id*='password' i]",
-        "input[placeholder*='password' i]",
-    ]
+        page.wait_for_selector("#id_password", timeout=10000)
+        page.fill("#id_password", password)
+        print("Filled password using #id_password")
 
-    filled_email = False
-    for sel in email_selectors:
-        try:
-            if page.locator(sel).count() > 0:
-                page.fill(sel, email)
-                filled_email = True
-                break
-        except Exception:
-            pass
+        page.click("input[type='submit'][value='Log in']")
+        print("Clicked Log in button")
 
-    filled_password = False
-    for sel in password_selectors:
-        try:
-            if page.locator(sel).count() > 0:
-                page.fill(sel, password)
-                filled_password = True
-                break
-        except Exception:
-            pass
+        page.wait_for_timeout(3000)
 
-    if not filled_email or not filled_password:
-        print("Could not auto-fill login. Please log in manually in the browser.")
-        input("After logging in manually, press Enter here... ")
-    else:
-        clicked = False
-        for sel in ["button[type='submit']", "button:has-text('Login')", "button:has-text('Sign in')", "input[type='submit']"]:
-            try:
-                if page.locator(sel).count() > 0:
-                    page.click(sel)
-                    clicked = True
-                    break
-            except Exception:
-                pass
-
-        if not clicked:
-            print("Could not find login button. Please click it manually.")
-            input("After login completes, press Enter here... ")
+        if "/login" in page.url.lower():
+            print("Still appears to be on login page.")
+            print("Either the credentials were rejected, or the login did not finish.")
+            print("Finish login manually in the browser.")
+            input("After logging in manually, press Enter here...")
         else:
-            page.wait_for_timeout(3000)
+            print("SafetyPark login probably worked.")
 
-    if shift_report_url:
-        print("Opening shift report URL...")
-        page.goto(shift_report_url, wait_until="networkidle")
-        page.wait_for_timeout(2000)
-    else:
-        print("No SAFETYPARK_SHIFT_REPORT_URL found in .env.")
-        print("Please navigate to the shift report creation page manually in the browser.")
-        input("Once the create shift report page is open, press Enter here... ")
+        return
 
-
-def fill_first_available(page, selectors, value, label):
-    for sel in selectors:
-        try:
-            if page.locator(sel).count() > 0:
-                page.fill(sel, str(value))
-                print(f"Filled {label} using {sel}: {value}")
-                return True
-        except Exception:
-            pass
-
-    print(f"Could not auto-fill {label}. You may need selector adjustment.")
-    return False
-
-
-def select_first_available(page, selectors, value, label):
-    for sel in selectors:
-        try:
-            if page.locator(sel).count() > 0:
-                page.select_option(sel, label=str(value))
-                print(f"Selected {label} by label using {sel}: {value}")
-                return True
-        except Exception:
-            pass
+    except Exception as e:
+        print("Exact SafetyPark login selectors failed:", e)
+        print("Available inputs on the login page:")
 
         try:
-            if page.locator(sel).count() > 0:
-                page.select_option(sel, value=str(value))
-                print(f"Selected {label} by value using {sel}: {value}")
-                return True
-        except Exception:
-            pass
+            inputs = page.locator("input").evaluate_all(
+                """
+                inputs => inputs.map(input => ({
+                    type: input.getAttribute("type"),
+                    name: input.getAttribute("name"),
+                    id: input.getAttribute("id"),
+                    placeholder: input.getAttribute("placeholder"),
+                    autocomplete: input.getAttribute("autocomplete")
+                }))
+                """
+            )
 
-    print(f"Could not auto-select {label}. You may need selector adjustment.")
-    return False
+            for item in inputs:
+                print(item)
+        except Exception as inspect_error:
+            print("Could not inspect login inputs:", inspect_error)
+
+        print("Please log in manually in the browser.")
+        input("After logging in manually, press Enter here...")
+        return
 
 
-def create_one_shift_report_guided(page, row):
+
+def simple_norm(value):
+    return " ".join(str(value or "").lower().replace("&amp;", "&").split())
+
+
+def safetypark_base_url(page):
+    from urllib.parse import urlparse
+    parsed = urlparse(page.url)
+
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(f"Cannot determine SafetyPark base URL from current page URL: {page.url}")
+
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def get_safetypark_location_id_map(page):
     """
-    First-pass guided automation.
+    Scrape the Shift Reports list page location filter.
 
-    This uses generic selectors. We will adjust once you test and send the terminal/browser result.
-    It intentionally does not submit the final form automatically unless the final confirmation passes.
+    The add form uses an autocomplete select, but the list page exposes the
+    SafetyPark location names and IDs in #location_select.
+    """
+
+    base = safetypark_base_url(page)
+    list_url = base + "/operations/shift/"
+
+    print("Reading SafetyPark location IDs from:", list_url)
+    page.goto(list_url, wait_until="networkidle")
+    page.wait_for_timeout(1500)
+
+    if page.locator("#location_select option").count() == 0:
+        print("Could not find #location_select options on the shift report list page.")
+        return {}
+
+    options = page.locator("#location_select option").evaluate_all(
+        """
+        options => options.map(option => ({
+            value: option.value,
+            text: (option.getAttribute("title") || option.textContent || "").trim()
+        })).filter(item => item.value && item.text)
+        """
+    )
+
+    location_map = {}
+
+    for item in options:
+        location_map[simple_norm(item["text"])] = item
+
+    print(f"Loaded {len(location_map)} SafetyPark location IDs.")
+    return location_map
+
+
+def open_add_shift_report_page(page):
+    base = safetypark_base_url(page)
+    add_url = base + "/operations/shift/add/"
+    print("Opening add shift report page:", add_url)
+    page.goto(add_url, wait_until="networkidle")
+    page.wait_for_timeout(1500)
+
+
+def select_safetypark_location_autocomplete(page, location_name, location_id_map):
+    key = simple_norm(location_name)
+
+    if key not in location_id_map:
+        print(f"Could not find SafetyPark location ID for: {location_name}")
+        print("Available close matches:")
+        for option_key, option in sorted(location_id_map.items()):
+            if key in option_key or option_key in key or key.split()[0:1] == option_key.split()[0:1]:
+                print(f"  - {option['text']} = {option['value']}")
+        return False
+
+    option = location_id_map[key]
+    option_id = str(option["value"])
+    option_text = str(option["text"])
+
+    page.evaluate(
+        """
+        ({optionId, optionText}) => {
+            const select = document.querySelector("#id_location");
+            if (!select) {
+                throw new Error("Could not find #id_location");
+            }
+
+            select.innerHTML = "";
+
+            const option = new Option(optionText, optionId, true, true);
+            select.appendChild(option);
+            select.value = optionId;
+
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+
+            if (window.django && django.jQuery) {
+                django.jQuery(select).trigger("change");
+            } else if (window.jQuery) {
+                window.jQuery(select).trigger("change");
+            }
+        }
+        """,
+        {"optionId": option_id, "optionText": option_text},
+    )
+
+    print(f"Selected SafetyPark location: {option_text} ({option_id})")
+    return True
+
+
+def fill_shift_basic_fields(page, row):
+    page.fill("#id_date", str(row["date"]))
+    print(f"Filled date: {row['date']}")
+
+    # Period values from the uploaded SafetyPark form:
+    # 1 = Lunch, 2 = Dinner, 3 = Graveyard
+    period_map = {
+        "lunch": "1",
+        "dinner": "2",
+        "graveyard": "3",
+    }
+
+    period_value = period_map.get(simple_norm(row["period"]), str(row["period"]))
+    page.select_option("#id_period", value=period_value)
+    print(f"Selected period: {row['period']}")
+
+    page.fill("#id_ticketrange_set-0-start", str(row["starting_ticket"]))
+    page.fill("#id_ticketrange_set-0-end", str(row["ending_ticket"]))
+    print(f"Filled ticket range: {row['starting_ticket']} to {row['ending_ticket']}")
+
+    # Keep the general totals at zero unless the user fills them manually.
+    for selector in ["#id_cars_hosted", "#id_cars_validated", "#id_cars_void"]:
+        try:
+            if page.locator(selector).count() > 0:
+                page.fill(selector, "0")
+        except Exception:
+            pass
+
+
+def build_cars_entries_for_form(row):
+    entries = []
+
+    for item in row["adjusted_amount_summary"]:
+        entries.append({
+            "charge": float(item["amount"]),
+            "cars": int(item["adjusted_cars_charged_count"]),
+            "payment_method": "4",  # Scan to Pay
+            "payment_method_label": "Scan to Pay",
+            "is_overnight": False,
+        })
+
+    for item in row["overtime_summary"]:
+        entries.append({
+            "charge": float(item["amount"]),
+            "cars": int(item["extension_count"]),
+            "payment_method": "1",  # Overtime
+            "payment_method_label": "Overtime",
+            "is_overnight": False,
+        })
+
+    return entries
+
+
+def fill_cars_charged_inline_rows(page, row):
+    entries = build_cars_entries_for_form(row)
+
+    if not entries:
+        print("No cars charged entries to fill.")
+        return
+
+    page.evaluate(
+        """
+        (entries) => {
+            const prefix = "cars_set";
+            const totalForms = document.querySelector(`#id_${prefix}-TOTAL_FORMS`);
+            const emptyRow = document.querySelector(`#${prefix}-empty`);
+            const tbody = emptyRow ? emptyRow.parentElement : document.querySelector(`#${prefix}-group tbody`);
+
+            if (!totalForms) {
+                throw new Error("Could not find cars_set TOTAL_FORMS");
+            }
+
+            if (!tbody) {
+                throw new Error("Could not find cars_set tbody");
+            }
+
+            function replacePrefixInNode(node, index) {
+                const html = node.outerHTML.replaceAll("__prefix__", String(index));
+                const wrapper = document.createElement("tbody");
+                wrapper.innerHTML = html;
+                const newNode = wrapper.firstElementChild;
+                newNode.classList.remove("empty-form");
+                newNode.id = `${prefix}-${index}`;
+                return newNode;
+            }
+
+            function ensureRow(index) {
+                let row = document.querySelector(`#${prefix}-${index}`);
+
+                if (row) {
+                    return row;
+                }
+
+                if (!emptyRow) {
+                    throw new Error("Could not create extra cars rows because empty form template was not found");
+                }
+
+                row = replacePrefixInNode(emptyRow, index);
+                tbody.insertBefore(row, emptyRow);
+                return row;
+            }
+
+            for (let i = 0; i < entries.length; i++) {
+                ensureRow(i);
+            }
+
+            totalForms.value = String(entries.length);
+
+            for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i];
+
+                const charge = document.querySelector(`#id_${prefix}-${i}-charge`);
+                const cars = document.querySelector(`#id_${prefix}-${i}-cars`);
+                const payment = document.querySelector(`#id_${prefix}-${i}-payment_method`);
+                const overnight = document.querySelector(`#id_${prefix}-${i}-is_overnight`);
+
+                if (!charge || !cars || !payment) {
+                    throw new Error(`Missing cars_set row fields for row ${i}`);
+                }
+
+                charge.value = String(entry.charge.toFixed(2));
+                cars.value = String(entry.cars);
+                payment.value = String(entry.payment_method);
+
+                if (overnight) {
+                    overnight.checked = Boolean(entry.is_overnight);
+                }
+
+                charge.dispatchEvent(new Event("input", { bubbles: true }));
+                cars.dispatchEvent(new Event("input", { bubbles: true }));
+                payment.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+        }
+        """,
+        entries,
+    )
+
+    print("Filled Cars charged rows:")
+    for entry in entries:
+        print(f"  ${entry['charge']:.2f}: {entry['cars']} cars, {entry['payment_method_label']}")
+
+
+def click_safe_save_button(page):
+    # Prefer Django admin's Save and Publish button, not regular Save.
+    for sel in [
+        "input[name='_publish']",
+        "button[name='_publish']",
+        "input[type='submit'][value='Save and Publish']",
+        "button:has-text('Save and Publish')",
+    ]:
+        try:
+            locator = page.locator(sel)
+            if locator.count() > 0:
+                locator.first.click()
+                page.wait_for_timeout(2000)
+                print(f"Clicked save and publish button: {sel}")
+                return True
+        except Exception:
+            pass
+
+    print("Could not find the Save and Publish button. Nothing clicked.")
+    return False
+
+def create_one_shift_report_guided(page, row, location_id_map):
+    """
+    Guided SafetyPark automation using selectors from the uploaded SafetyPark Add Shift Report HTML.
+
+    It fills:
+    - Location
+    - Date
+    - Period
+    - Ticket range
+    - Cars charged rows, with payment method:
+        Scan to Pay for regular charged cars
+        Overtime for EXT tickets
+
+    It still pauses before final save.
     """
 
     print("\nPreparing SafetyPark shift report for:", row["shift_report_location"])
 
-    # Try common "new/create report" buttons.
-    for sel in [
-        "button:has-text('New')",
-        "button:has-text('Create')",
-        "a:has-text('New')",
-        "a:has-text('Create')",
-        "button:has-text('Add')",
-        "a:has-text('Add')",
-    ]:
-        try:
-            if page.locator(sel).count() > 0:
-                page.click(sel)
-                page.wait_for_timeout(1000)
-                print(f"Clicked create/new button: {sel}")
-                break
-        except Exception:
-            pass
+    open_add_shift_report_page(page)
 
-    # Location
-    select_first_available(
-        page,
-        [
-            "select[name*='location' i]",
-            "select[id*='location' i]",
-            "select",
-        ],
-        row["shift_report_location"],
-        "location",
+    selected_location = select_safetypark_location_autocomplete(
+        page=page,
+        location_name=row["shift_report_location"],
+        location_id_map=location_id_map,
     )
 
-    # Date
-    fill_first_available(
-        page,
-        [
-            "input[type='date']",
-            "input[name*='date' i]",
-            "input[id*='date' i]",
-        ],
-        row["date"],
-        "date",
-    )
+    if not selected_location:
+        print("Location was NOT selected automatically. Fix this manually before saving.")
 
-    # Period
-    select_first_available(
-        page,
-        [
-            "select[name*='period' i]",
-            "select[id*='period' i]",
-            "select[name*='shift' i]",
-            "select[id*='shift' i]",
-        ],
-        row["period"],
-        "period",
-    )
+    fill_shift_basic_fields(page, row)
+    fill_cars_charged_inline_rows(page, row)
 
-    # Starting ticket
-    fill_first_available(
-        page,
-        [
-            "input[name*='start' i][name*='ticket' i]",
-            "input[id*='start' i][id*='ticket' i]",
-            "input[name*='starting' i]",
-            "input[id*='starting' i]",
-        ],
-        row["starting_ticket"],
-        "starting ticket",
-    )
+    if AUTO_SAVE_EACH_LOCATION:
+        print("Web app approved all locations.")
+        print("Skipping browser inspection prompt and saving this location automatically.")
+        click_safe_save_button(page)
+        return
 
-    # Ending ticket
-    fill_first_available(
-        page,
-        [
-            "input[name*='end' i][name*='ticket' i]",
-            "input[id*='end' i][id*='ticket' i]",
-            "input[name*='ending' i]",
-            "input[id*='ending' i]",
-        ],
-        row["ending_ticket"],
-        "ending ticket",
-    )
-
-    print("\nCars charged by value to enter:")
-    for item in row["adjusted_amount_summary"]:
-        print(f"  ${item['amount']:.2f}: {item['adjusted_cars_charged_count']} cars")
-
-    print("\nOvertime / EXT tickets to enter:")
-    for item in row["overtime_summary"]:
-        print(f"  ${item['amount']:.2f}: {item['extension_count']} extensions")
-
-    print("\nThe basic fields may be filled, but charge-bucket rows may need custom selectors.")
-    print("Please inspect the browser. Fill/fix any missing charge rows manually for this location.")
+    print("\nPlease inspect the browser.")
+    print("The script attempted to fill location, date, period, tickets, and charge rows.")
+    print("Fix anything wrong before continuing.")
     input("When this location looks correct in the browser, press Enter to continue to final save check...")
 
     print("Final save check for this one location.")
-    typed = input(f"Type SAVE {row['shift_report_location']} to click a save/submit button, or press Enter to skip saving: ").strip()
 
-    if typed != f"SAVE {row['shift_report_location']}":
+    typed = input("Type y to save this shift report, or press Enter to skip saving: ").strip().lower()
+
+    if typed != "y":
         print("Skipped saving this location.")
         return
 
-    for sel in [
-        "button:has-text('Save')",
-        "button:has-text('Submit')",
-        "button[type='submit']",
-        "input[type='submit']",
-    ]:
-        try:
-            if page.locator(sel).count() > 0:
-                page.click(sel)
-                page.wait_for_timeout(2000)
-                print("Clicked save/submit.")
-                return
-        except Exception:
-            pass
-
-    print("Could not find save/submit button. Nothing clicked.")
+    click_safe_save_button(page)
 
 
 def open_safetypark_and_create_reports(reports):
@@ -867,8 +1027,10 @@ def open_safetypark_and_create_reports(reports):
         print("The script will create/fill reports one at a time.")
         print("It will pause before each final save.")
 
+        location_id_map = get_safetypark_location_id_map(page)
+
         for _, row in reports.iterrows():
-            create_one_shift_report_guided(page, row)
+            create_one_shift_report_guided(page, row, location_id_map)
 
         print("Done with guided SafetyPark shift report process.")
         input("Press Enter to close browser...")
@@ -885,10 +1047,18 @@ def main():
     parser.add_argument("--date", default=None, help="Report date YYYY-MM-DD. Default is yesterday.")
     parser.add_argument("--csv", default=None, help="Use an already-downloaded Resolve scan-to-pay CSV.")
     parser.add_argument("--mapping", default=DEFAULT_MAPPING_FILE, help="CSV mapping Resolve locations to SafetyPark locations.")
-    parser.add_argument("--open-safetypark", action="store_true", help="After terminal confirmation, open SafetyPark app and start guided form fill.")
+    parser.add_argument("--open-safetypark", action="store_true", help="After confirmation, open SafetyPark app and start guided form fill.")
+    parser.add_argument("--review-only", action="store_true", help="Print SHIFT REPORT REVIEW and exit without asking for confirmation.")
+    parser.add_argument("--web-confirmed", action="store_true", help="Skip terminal review confirmation because the web app already confirmed it.")
+    parser.add_argument("--auto-save-each-location", action="store_true", help="Save each filled SafetyPark form without asking for per-location terminal confirmation.")
+    parser.add_argument("--only-shift-location", default=None, help="Only calculate/create one SafetyPark shift report location, such as 100 Venice Way.")
+    parser.add_argument("--only-resolve-location", default=None, help="Only include rows from one Resolve location before grouping, such as 100 Venice Way Parking.")
     parser.add_argument("--no-download", action="store_true", help="Do not download. Requires --csv.")
 
     args = parser.parse_args()
+
+    global AUTO_SAVE_EACH_LOCATION
+    AUTO_SAVE_EACH_LOCATION = bool(getattr(args, "auto_save_each_location", False))
 
     if args.date:
         target_date = datetime.strptime(args.date, "%Y-%m-%d")
@@ -906,23 +1076,89 @@ def main():
 
     reports, source_rows = build_shift_report_data(csv_path, target_date, args.mapping)
 
+    if reports.empty:
+        print("No reports to process. Stopping.")
+        return
+
+    if args.only_resolve_location:
+        key = args.only_resolve_location.strip().lower()
+        matching_locations = [
+            loc for loc in source_rows["Location"].dropna().astype(str).unique().tolist()
+            if key in loc.lower()
+        ]
+
+        if not matching_locations:
+            print("No source rows matched --only-resolve-location.")
+            print("Available Resolve locations:")
+            for loc in sorted(source_rows["Location"].dropna().astype(str).unique().tolist()):
+                print("  -", loc)
+            return
+
+        allowed_shift_locations = sorted(
+            source_rows[source_rows["Location"].astype(str).isin(matching_locations)]["shift_report_location"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+        reports = reports[reports["shift_report_location"].astype(str).isin(allowed_shift_locations)].copy()
+
+        print("\nFILTER APPLIED")
+        print("-" * 100)
+        print("Only Resolve location search:", args.only_resolve_location)
+        print("Matched Resolve locations:")
+        for loc in matching_locations:
+            print("  -", loc)
+        print("Shift report locations kept:")
+        for loc in allowed_shift_locations:
+            print("  -", loc)
+
+    if args.only_shift_location:
+        key = args.only_shift_location.strip().lower()
+        before_count = len(reports)
+
+        reports = reports[
+            reports["shift_report_location"].astype(str).str.lower().str.contains(key, regex=False)
+        ].copy()
+
+        if reports.empty:
+            print("No shift reports matched --only-shift-location.")
+            print("Available shift report locations:")
+            # Rebuild list from unfiltered source rows.
+            available = sorted(source_rows["shift_report_location"].dropna().astype(str).unique().tolist())
+            for loc in available:
+                print("  -", loc)
+            return
+
+        print("\nFILTER APPLIED")
+        print("-" * 100)
+        print(f"Only shift report location search: {args.only_shift_location}")
+        print(f"Reports kept: {len(reports)} of {before_count}")
+
     print_shift_report_review(reports)
 
     if reports.empty:
         print("No reports to create. Stopping.")
         return
 
-    ok = require_terminal_confirmation()
-
-    if not ok:
+    if args.review_only:
+        print("\nReview-only mode complete. No SafetyPark forms were opened or submitted.")
         return
 
     if not args.open_safetypark:
-        print("\nConfirmation was accepted, but --open-safetypark was not passed.")
+        print("\n--open-safetypark was not passed.")
         print("No SafetyPark forms were opened or submitted.")
-        print("Run this when ready:")
-        print(f"py create_shift_reports_from_resolve.py --csv \"{csv_path}\" --date {safe_date(target_date)} --open-safetypark")
+        print("Run with --open-safetypark when ready.")
         return
+
+    if args.web_confirmed:
+        print("\nWeb confirmation accepted. Skipping terminal confirmation phrase.")
+    else:
+        ok = require_terminal_confirmation()
+
+        if not ok:
+            return
 
     open_safetypark_and_create_reports(reports)
 

@@ -23,7 +23,7 @@ import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = APP_DIR / "shift_report_downloads"
-DEFAULT_MAPPING = APP_DIR / "location_merge_map_v3.csv"
+DEFAULT_MAPPING = APP_DIR / "location_merge_map.csv"
 
 
 # ------------------------------------------------------------
@@ -668,7 +668,7 @@ def render_price_consistency_page():
     if DEFAULT_MAPPING.exists():
         st.caption(f"Using location mapping: {DEFAULT_MAPPING.name}")
     else:
-        st.warning("location_merge_map_v3.csv was not found. Location names will be compared as-is.")
+        st.warning("location_merge_map.csv was not found. Location names will be compared as-is.")
 
     if st.button("Run price consistency check", type="primary"):
         try:
