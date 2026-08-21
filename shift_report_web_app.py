@@ -30,6 +30,41 @@ from price_consistency_page import render_price_consistency_page
 import pandas as pd
 import streamlit as st
 
+import hmac
+import os
+import streamlit as st
+
+
+def require_password():
+    correct_password = os.environ.get("APP_PASSWORD")
+
+    if not correct_password:
+        st.error("APP_PASSWORD is not configured.")
+        st.stop()
+
+    # Already logged in for this browser session
+    if st.session_state.get("authenticated", False):
+        return
+
+    st.title("Resolve → Safety Automation")
+    st.caption("Authorized access only")
+
+    entered_password = st.text_input(
+        "Password",
+        type="password"
+    )
+
+    if st.button("Log in", type="primary"):
+        if hmac.compare_digest(entered_password, correct_password):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.stop()
+
+
+require_password()
 
 APP_DIR = Path(__file__).resolve().parent
 
