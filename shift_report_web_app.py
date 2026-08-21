@@ -26,6 +26,7 @@ import subprocess
 from pathlib import Path
 from datetime import date
 from price_consistency_page import render_price_consistency_page
+from dotenv import load_dotenv
 
 import pandas as pd
 import streamlit as st
@@ -34,6 +35,7 @@ import hmac
 import os
 import streamlit as st
 
+load_dotenv()
 
 def require_password():
     correct_password = os.environ.get("APP_PASSWORD")
